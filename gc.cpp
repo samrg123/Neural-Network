@@ -1,7 +1,16 @@
 #include "network.h"
+#include "Bitmap.h"
+#include "Graphics.h"
+#include "NeuronDrawer.h"
+
 #include <windows.h>
 #include <Windowsx.h>
+
+#include <queue>
+#include <string>
 #include <stdio.h>
+#include <cassert>
+#include <filesystem>
 
 typedef unsigned int uint;
 typedef unsigned char uchar;
@@ -791,6 +800,140 @@ struct AvgError {
 	uint count = 0;
 } avgError;
 
+void generateClassifierSolutions(int solutionsPerCategory = 5) {
+
+	float* result = new float[numOfCategories];
+	float currentPixels[ImgSize];
+
+	struct MSEImage {
+		float mse;
+		float pixels[ImgSize];
+
+		MSEImage(float mse, float(&srcPixels)[ImgSize]): mse{mse} {
+			memcpy(pixels, srcPixels, sizeof(srcPixels));
+		}
+
+		bool operator<(const MSEImage& img) const { return mse < img.mse; } 
+	};
+
+	using HeapT = std::priority_queue<MSEImage>;
+	HeapT* bestResults = new HeapT[numOfCategories];
+
+	
+	// Iterate over each permutation of input and remember the best performing solutions for each category
+	constexpr int xBruteForceBits = 4;
+	constexpr int yBruteForceBits = 4;
+	constexpr int nBruteForceBits = xBruteForceBits * yBruteForceBits;
+
+	constexpr int xPixelsPerBruteForceBit = ImgWidth / xBruteForceBits;
+	constexpr int yPixelsPerBruteForceBit = ImgHeight / xBruteForceBits;
+
+	for(int bruteForceBits = 0; bruteForceBits < (1 << nBruteForceBits); ++bruteForceBits) {
+
+		// create image permutation from bruteForceBits
+		// Note: there is probably a faster way to do this, but this is fine for now
+		for(int pixelIndex = 0; pixelIndex < ImgSize; ++pixelIndex) {
+
+			int pixelY = pixelIndex / ImgWidth;
+			int pixelX = pixelIndex - pixelY*ImgWidth;
+
+			int bruteForceY = pixelY / yPixelsPerBruteForceBit;
+			int bruteForceX = pixelX / xPixelsPerBruteForceBit;
+
+			int bruteForceBitIndex = bruteForceY*xBruteForceBits + bruteForceX;
+			float pixelValue = (bruteForceBits >> bruteForceBitIndex) & 1;
+
+			currentPixels[pixelIndex] = pixelValue;
+		}
+
+		// evaluate image
+		classifier->eval(currentPixels, result);
+
+		// compute result MSE for each category and store best results
+		for(int categoryIndex = 0; categoryIndex < numOfCategories; ++categoryIndex) {
+			
+			float mse = 0;
+			for(int i = 0; i < numOfCategories; ++i) {
+				float expectedValue = (categoryIndex == i) ? 1 : 0;
+				float delta = result[i] - expectedValue;
+				mse+= delta*delta;
+			}
+
+			HeapT& bestResult = bestResults[categoryIndex];			
+			if(bestResult.size() < solutionsPerCategory) {
+
+				bestResult.push(MSEImage(mse, currentPixels));
+
+				printf("Initializing Category: %d, MSE: %f\n", categoryIndex, mse);
+
+			} else if(bestResult.top().mse > mse) {
+
+				bestResult.pop();
+				bestResult.push(MSEImage(mse, currentPixels));
+				printf("Updating Category: %d, MSE: %f\n", categoryIndex, mse);
+			}
+		}
+	}
+
+	// save off best images for each category
+	// Warn: this destroys bestResult
+	std::filesystem::path basePath("./classifierSolutions");
+	std::filesystem::create_directories(basePath);
+	
+	PackedImageList::node* node = iList.head;
+	Bitmap bmp(ImgWidth, ImgHeight);
+	for(int categoryIndex = 0; categoryIndex < numOfCategories; ++categoryIndex) {
+		assert(node);
+		
+		std::filesystem::path bmpBasename = (basePath / node->image->category);
+		
+		HeapT& bestResult = bestResults[categoryIndex];
+		for(int resultRank = solutionsPerCategory; !bestResult.empty(); bestResult.pop(), --resultRank) {
+
+			const MSEImage& mseImage = bestResult.top();		
+
+			std::string filename = bmpBasename.string() + "_" + std::to_string(resultRank) + ".bmp";
+			printf("Saving: '%s' with MSE of: %f\n", filename.c_str(), mseImage.mse);
+
+			// copy floating point image to bmp buffer
+			for(int i = 0; i < ImgSize; ++i) {
+
+				float lightness = mseImage.pixels[i];
+
+				int rgb;
+				hslToRGB(0, 0, lightness, &rgb);
+
+				bmp.pixels[i] = rgb;
+			}
+			
+			bmp.write(filename.c_str());
+		}
+
+		printf("---\n");
+		node = node->next;
+	}
+	assert(!node);
+
+	delete[] result;
+	delete[] bestResults;
+}
+
+void drawNetworkToFile(Network* network, const char* filename) {
+	
+	printf("Saving network drawing to '%s'\n", filename);
+
+	NeuronDrawerPref prefs;
+	prefs.layerPadding = 200;
+	prefs.neuronRadius = 5; //25
+	prefs.neuronPadding = 5; //5
+	prefs.neuronOutlineWidth = 1;  //3
+	prefs.lineWidth = 1;
+
+	Bitmap* bmp = drawNetwork(network, &prefs, nullptr);
+	bmp->write(filename);
+	delete bmp;
+}
+
 int main() {
 
 	//load images
@@ -930,8 +1073,6 @@ int main() {
 			if((iData->pixelPos+=iData->stride) >= iData->size) iData->pixelPos = 0;
 		}
 	}
-	generator->disableTurbo();
-	classifier->disableTurbo();
 
 	// this way they are the latest ones
 	drawGeneratorEigenVectors(); 
@@ -939,7 +1080,7 @@ int main() {
 
 	//prepare windows for input
 	swapWindowsToInput();
-	
+
 	//input loop
 	//TODO - add commands to load and eval images from the dataset
 	char strIn[256];
@@ -948,8 +1089,11 @@ int main() {
 		printf("type 'exit' to quit\n");
 		gets_s(strIn);
 		
-		if(!strcmp(strIn, "exit")) break;
-		else if(!strcmp(strIn, "openClassifier")) {
+		if(!strcmp(strIn, "exit")) { 
+		
+			break;
+		
+		} else if(!strcmp(strIn, "openClassifier")) {
 			
 			if(classifierWindow.hwnd) printf("Classifier window already open\n");
 			else createWindowThread(&classifierWindow);
@@ -959,8 +1103,23 @@ int main() {
 			if(generatorWindow.hwnd) printf("Generator window already open\n");
 			else createWindowThread(&generatorWindow);
 		
+		} else if(!strcmp(strIn, "generateClassifierSolutions")) {
+		
+			generateClassifierSolutions();
+
+		} else if(!strcmp(strIn, "drawClassifier")) {
+	
+			drawNetworkToFile(classifier, "classifier.bmp");
+		
+		} else if(!strcmp(strIn, "drawGenerator")) {
+			
+			drawNetworkToFile(generator, "generator.bmp");
+
 		} else printf("Invalid Command '%s'\n", strIn);
 	}
+
+	generator->disableTurbo();
+	classifier->disableTurbo();	
 
 	return ERROR_None;
 }
